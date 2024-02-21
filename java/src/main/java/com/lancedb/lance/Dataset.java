@@ -34,7 +34,6 @@ public class Dataset implements Closeable {
 
   private Dataset() {
   }
-
   public static Dataset write(ArrowArrayStream stream, String path, WriteParams params) {
     return writeWithFfiStream(stream.memoryAddress(), path, params.toMap());
   }
