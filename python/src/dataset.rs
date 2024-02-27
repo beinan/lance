@@ -34,10 +34,7 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
-use lance::index::{
-    scalar::ScalarIndexParams,
-    vector::{diskann::DiskANNParams, VectorIndexParams},
-};
+use lance::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
 use lance_index::optimize::OptimizeOptions;
@@ -56,7 +53,7 @@ use pyo3::types::{PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
-    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong},
+    types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong},
     PyObject, PyResult,
 };
 use snafu::{location, Location};
@@ -385,6 +382,7 @@ impl Dataset {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        columns_with_transform: Option<Vec<(String, String)>>,
         filter: Option<String>,
         prefilter: Option<bool>,
         limit: Option<i64>,
@@ -400,10 +398,23 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
-        if let Some(c) = columns {
-            scanner
-                .project(&c)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        match (columns, columns_with_transform) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "Cannot specify both columns and columns_with_transform",
+                ))
+            }
+            (Some(c), None) => {
+                scanner
+                    .project(&c)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, Some(ct)) => {
+                scanner
+                    .project_with_transform(&ct)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            (None, None) => {}
         }
         if let Some(f) = filter {
             if substrait_filter.is_some() {
@@ -653,12 +664,36 @@ impl Dataset {
                     obj.get_item("name")?.map(|n| n.extract()).transpose()?;
                 let nullable: Option<bool> =
                     obj.get_item("nullable")?.map(|n| n.extract()).transpose()?;
+                let data_type: Option<PyArrowType<DataType>> = obj
+                    .get_item("data_type")?
+                    .map(|n| n.extract())
+                    .transpose()?;
+
+                for key in obj.keys().iter().map(|k| k.extract::<String>()) {
+                    let k = key?;
+                    if k != "path" && k != "name" && k != "nullable" && k != "data_type" {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown key: {}. Valid keys are name, nullable, and data_type.",
+                            k
+                        )));
+                    }
+                }
+
+                if name.is_none() && nullable.is_none() && data_type.is_none() {
+                    return Err(PyValueError::new_err(
+                        "At least one of name, nullable, or data_type must be specified",
+                    ));
+                }
+
                 let mut alteration = ColumnAlteration::new(path);
                 if let Some(name) = name {
                     alteration = alteration.rename(name);
                 }
                 if let Some(nullable) = nullable {
                     alteration = alteration.set_nullable(nullable);
+                }
+                if let Some(data_type) = data_type {
+                    alteration = alteration.cast_to(data_type.0);
                 }
                 Ok(alteration)
             })
@@ -840,7 +875,7 @@ impl Dataset {
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
             "BTREE" => IndexType::Scalar,
-            "IVF_PQ" | "DISKANN" => IndexType::Vector,
+            "IVF_PQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -941,29 +976,6 @@ impl Dataset {
                 Box::new(VectorIndexParams::with_ivf_pq_params(
                     m_type, ivf_params, pq_params,
                 ))
-            }
-            "DISKANN" => {
-                let mut params = DiskANNParams::default();
-                let mut m_type = MetricType::L2;
-                if let Some(kwargs) = kwargs {
-                    if let Some(mt) = kwargs.get_item("metric_type")? {
-                        m_type = MetricType::try_from(mt.to_string().to_lowercase().as_str())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
-
-                    if let Some(n) = kwargs.get_item("r")? {
-                        params.r = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("alpha")? {
-                        params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
-                    };
-
-                    if let Some(n) = kwargs.get_item("l")? {
-                        params.l = PyAny::downcast::<PyInt>(n)?.extract()?
-                    };
-                }
-                Box::new(VectorIndexParams::with_diskann_params(m_type, params))
             }
             _ => {
                 return Err(PyValueError::new_err(format!(

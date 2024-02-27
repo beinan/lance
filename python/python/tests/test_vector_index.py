@@ -78,9 +78,9 @@ def run(ds, q=None, assert_func=None):
             expected_columns.extend(ds.schema.names)
         else:
             expected_columns.extend(columns)
-        for c in ["vector", "_distance"]:
-            if c not in expected_columns:
-                expected_columns.append(c)
+        # TODO: _distance shouldn't be returned by default either
+        if "_distance" not in expected_columns:
+            expected_columns.append("_distance")
 
         for filter_ in filters:
             for rf in refine:
@@ -130,6 +130,8 @@ def test_ann_append(tmp_path):
     q = new_data["vector"][0].as_py()
 
     def func(rs: pa.Table):
+        if "vector" not in rs:
+            return
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
@@ -639,3 +641,29 @@ def test_validate_vector_index(tmp_path: Path):
     ds.sample = direct_first_call_to_new_table
     with pytest.raises(ValueError, match="Vector index failed sanity check"):
         validate_vector_index(ds, "vector", sample_size=100)
+
+
+def test_dynamic_projection_with_vectors_index(tmp_path: Path):
+    ds = lance.write_dataset(create_table(), tmp_path)
+    ds = ds.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+        },
+        columns={
+            "vec": "vector",
+            "vec_f16": "_cast_list_f16(vector)",
+        },
+    )
+
+    # TODO: _distance shouldn't be returned by default
+    assert res.column_names == ["vec", "vec_f16", "_distance"]
+
+    original = np.stack(res["vec"].to_numpy())
+    casted = np.stack(res["vec_f16"].to_numpy())
+
+    assert (original.astype(np.float16) == casted).all()

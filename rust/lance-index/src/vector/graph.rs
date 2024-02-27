@@ -15,19 +15,27 @@
 //! Generic Graph implementation.
 //!
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
-use lance_arrow::FloatToArrayType;
+use arrow_schema::{DataType, Field};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Cosine, DistanceFunc, Dot, MetricType, L2};
-use num_traits::{AsPrimitive, Float, PrimInt};
 use snafu::{location, Location};
 
 pub(crate) mod builder;
+pub mod memory;
 pub(super) mod storage;
 
-use storage::VectorStorage;
+/// Vector storage to back a graph.
+pub use storage::VectorStorage;
+
+pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
+
+lazy_static::lazy_static! {
+    /// NEIGHBORS field.
+    pub static ref NEIGHBORS_FIELD: Field =
+        Field::new(NEIGHBORS_COL, DataType::List(Field::new_list_field(DataType::UInt32, true).into()), true);
+}
 
 pub struct GraphNode<I = u32> {
     pub id: I,
@@ -47,17 +55,6 @@ impl<I> From<I> for GraphNode<I> {
             neighbors: vec![],
         }
     }
-}
-
-#[async_trait::async_trait]
-pub trait SerializeToLance {
-    /// Serialize the object to one single Lance file.
-    ///
-    /// Parameters
-    /// ----------
-    /// path : str
-    ///
-    async fn to_lance(&self, path: &str) -> Result<()>;
 }
 
 /// A wrapper for f32 to make it ordered, so that we can put it into
@@ -91,13 +88,53 @@ impl From<OrderedFloat> for f32 {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub(crate) struct OrderedNode {
+    pub id: u32,
+    pub dist: OrderedFloat,
+}
+
+impl PartialOrd for OrderedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.dist.cmp(&other.dist))
+    }
+}
+
+impl Ord for OrderedNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist.cmp(&other.dist)
+    }
+}
+
+impl From<(OrderedFloat, u32)> for OrderedNode {
+    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+        Self { id, dist }
+    }
+}
+
+impl From<OrderedNode> for (OrderedFloat, u32) {
+    fn from(node: OrderedNode) -> Self {
+        (node.dist, node.id)
+    }
+}
+
+/// Distance calculator.
+///
+/// This trait is used to calculate a query vector to a stream of vector IDs.
+///
+pub trait DistanceCalculator {
+    /// Compute distances between one query vector to all the vectors in the
+    /// list of IDs.
+    fn compute_distances(&self, ids: &[u32]) -> Box<dyn Iterator<Item = f32>>;
+}
+
 /// Graph trait.
 ///
 /// Type parameters
 /// ---------------
 /// K: Vertex Index type
 /// T: the data type of vector, i.e., ``f32`` or ``f16``.
-pub trait Graph<K: PrimInt = u32, T: Float = f32> {
+pub trait Graph {
     /// Get the number of nodes in the graph.
     fn len(&self) -> usize;
 
@@ -107,28 +144,10 @@ pub trait Graph<K: PrimInt = u32, T: Float = f32> {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: K) -> Option<Box<dyn Iterator<Item = K> + '_>>;
+    fn neighbors(&self, key: u32) -> Option<Box<dyn Iterator<Item = u32> + '_>>;
 
-    /// Distance from query vector to a node.
-    fn distance_to(&self, query: &[T], key: K) -> f32;
-
-    /// Distance between two nodes in the graph.
-    ///
-    /// Returns the distance between two nodes as float32.
-    fn distance_between(&self, a: K, b: K) -> f32;
-}
-
-/// Serializable Graph.
-///
-/// Type parameters
-/// ----------------
-/// I : Vertex Index type
-/// V : the data type of vector, i.e., ``f32`` or ``f16``.
-struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorStorage<T>> {
-    pub nodes: HashMap<I, GraphNode<I>>,
-    vectors: V,
-    dist_fn: Box<DistanceFunc<T>>,
-    phantom: std::marker::PhantomData<T>,
+    /// Access to underline storage
+    fn storage(&self) -> Arc<dyn VectorStorage>;
 }
 
 /// Beam search over a graph
@@ -148,23 +167,26 @@ struct InMemoryGraph<I: PrimInt + Hash, T: FloatToArrayType, V: storage::VectorS
 /// -------
 /// A sorted list of ``(dist, node_id)`` pairs.
 ///
-pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
-    graph: &dyn Graph<I>,
-    start: &[I],
+pub(super) fn beam_search(
+    graph: &dyn Graph,
+    start: &[u32],
     query: &[f32],
     k: usize,
-) -> Result<BTreeMap<OrderedFloat, I>> {
-    let mut visited: HashSet<I> = start.iter().copied().collect();
-    let mut candidates = start
+) -> Result<BTreeMap<OrderedFloat, u32>> {
+    let mut visited: HashSet<_> = start.iter().copied().collect();
+    let dist_calc = graph.storage().dist_calculator(query);
+    let mut candidates: BTreeMap<OrderedFloat, _> = dist_calc
+        .distance(start)
         .iter()
-        .map(|&i| (graph.distance_to(query, i).into(), i))
+        .zip(start)
+        .map(|(&dist, id)| (dist.into(), *id))
         .collect::<BTreeMap<_, _>>();
     let mut results = candidates.clone();
 
     while !candidates.is_empty() {
         let (dist, current) = candidates.pop_first().expect("candidates is empty");
         let furtherst = *results.last_key_value().expect("results set is empty").0;
-        if dist < furtherst {
+        if dist > furtherst {
             break;
         }
         let neighbors = graph.neighbors(current).ok_or_else(|| Error::Index {
@@ -177,56 +199,18 @@ pub(super) fn beam_search<I: PrimInt + Hash + std::fmt::Display>(
                 continue;
             }
             visited.insert(neighbor);
-            let dist = graph.distance_to(query, neighbor).into();
+            let furtherst = *results.last_key_value().expect("results set is empty").0;
+            let dist = dist_calc.distance(&[neighbor])[0].into();
             if dist < furtherst || results.len() < k {
                 results.insert(dist, neighbor);
                 candidates.insert(dist, neighbor);
+                if results.len() > k {
+                    results.pop_last();
+                }
             }
-        }
-        // Maintain the size of the result set.
-        while results.len() > k {
-            results.pop_last();
         }
     }
     Ok(results)
-}
-
-impl<I: PrimInt + Hash + AsPrimitive<usize>, T: FloatToArrayType, V: storage::VectorStorage<T>>
-    Graph<I, T> for InMemoryGraph<I, T, V>
-{
-    fn neighbors(&self, key: I) -> Option<Box<dyn Iterator<Item = I> + '_>> {
-        self.nodes
-            .get(&key)
-            .map(|n| Box::new(n.neighbors.iter().copied()) as Box<dyn Iterator<Item = I>>)
-    }
-
-    fn distance_to(&self, query: &[T], idx: I) -> f32 {
-        let vec = self.vectors.get(idx.as_());
-        (self.dist_fn)(query, vec)
-    }
-
-    fn distance_between(&self, a: I, b: I) -> f32 {
-        let from_vec = self.vectors.get(a.as_());
-        self.distance_to(from_vec, b)
-    }
-
-    fn len(&self) -> usize {
-        self.nodes.len()
-    }
-}
-
-impl<I: PrimInt + Hash, T: FloatToArrayType, V: VectorStorage<T>> InMemoryGraph<I, T, V>
-where
-    T::ArrowType: L2 + Cosine + Dot,
-{
-    fn from_builder(nodes: HashMap<I, GraphNode<I>>, vectors: V, metric_type: MetricType) -> Self {
-        Self {
-            nodes,
-            vectors,
-            dist_fn: metric_type.func::<T>().into(),
-            phantom: std::marker::PhantomData,
-        }
-    }
 }
 
 #[cfg(test)]
