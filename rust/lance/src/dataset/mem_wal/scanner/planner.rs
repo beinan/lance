@@ -65,7 +65,7 @@ pub struct LsmScanPlanner {
 /// at once when planning an LSM read. Each flushed generation costs a
 /// manifest and a schema read against object storage; 16 in flight keeps a
 /// 100-source read in the low hundreds of milliseconds instead of seconds.
-pub(crate) const SOURCE_SCAN_BUILD_CONCURRENCY: usize = 16;
+const SOURCE_SCAN_BUILD_CONCURRENCY: usize = 16;
 
 impl LsmScanPlanner {
     /// Create a new planner.
@@ -196,8 +196,14 @@ impl LsmScanPlanner {
         // bounded concurrency and reassemble in source order; everything
         // after the open (block filter, limit, tagging) is pure and cheap,
         // so it stays sequential below.
-        let scans: Vec<Arc<dyn ExecutionPlan>> = {
-            let arms = sources.iter().map(|source| {
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object. An arm
+        // resolves a generation's schema before it scans, which nests deeply
+        // enough to need that. The arms are materialized before streaming so
+        // the stream owns plain trait objects, not a closure over `sources`.
+        let arms: Vec<futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>> = sources
+            .iter()
+            .map(|source| {
                 let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
                 let has_block_filter = block_lists
                     .contains_key(&(source.shard_id(), source.generation()))
@@ -206,19 +212,14 @@ impl LsmScanPlanner {
                     (Some(n), false, false) => Some(n),
                     _ => None,
                 };
-                // Type-erased, not merely boxed: the `Send` proof recurses
-                // through a boxed future's concrete type but stops at a trait
-                // object. An arm resolves a generation's schema before it
-                // scans, which nests deeply enough to need that.
-                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                    Box::pin(self.build_source_scan(source, projection, filter, fetch));
-                arm
-            });
-            futures::stream::iter(arms)
-                .buffered(SOURCE_SCAN_BUILD_CONCURRENCY)
-                .try_collect()
-                .await?
-        };
+                Box::pin(self.build_source_scan(source, projection, filter, fetch))
+                    as futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>
+            })
+            .collect();
+        let scans: Vec<Arc<dyn ExecutionPlan>> = futures::stream::iter(arms)
+            .buffered(SOURCE_SCAN_BUILD_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         let mut source_plans = Vec::new();
         for (source, scan) in sources.into_iter().zip(scans) {
@@ -816,7 +817,7 @@ mod integration_tests {
             create_dataset(&base_uri, vec![create_test_batch(&schema, &[1], "base")]).await,
         );
         let shard_id = Uuid::new_v4();
-        let gens = crate::dataset::mem_wal::scanner::planner::SOURCE_SCAN_BUILD_CONCURRENCY * 2 + 3;
+        let gens = super::SOURCE_SCAN_BUILD_CONCURRENCY * 2 + 3;
         let mut snapshot = ShardSnapshot::new(shard_id).with_current_generation(gens as u64 + 1);
         for g in 1..=gens {
             let uri = format!("{}/_mem_wal/{}/gen_{}", base_uri, shard_id, g);
